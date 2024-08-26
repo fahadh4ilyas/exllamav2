@@ -10,6 +10,7 @@ from exllamav2 import(
     ExLlamaV2Cache_Q4,
     ExLlamaV2Cache_Q6,
     ExLlamaV2Cache_Q8,
+    ExLlamaV2Cache_TP,
     ExLlamaV2Tokenizer,
     model_init,
 )
@@ -61,7 +62,7 @@ parser.add_argument("-cq8", "--cache_q8", action = "store_true", help = "Use Q8 
 
 parser.add_argument("-ngram", "--ngram_decoding", action = "store_true", help = "Use n-gram speculative decoding")
 
-parser.add_argument("-pt", "--print_timings", action = "store_true", help = "Output timings after each prompt")
+parser.add_argument("-pt", "--print_timings", action = "store_true", help = "Output timings/stats after each prompt")
 parser.add_argument("-amnesia", "--amnesia", action = "store_true", help = "Forget context after every response")
 
 # Arrrgs
@@ -94,7 +95,7 @@ if system_prompt is None: system_prompt = prompt_format.default_system_prompt()
 
 model_init.check_args(args)
 model_init.print_options(args)
-model, tokenizer = model_init.init(args, allow_auto_split = True, max_output_len = 16)
+model, tokenizer = model_init.init(args, allow_auto_split = True, max_output_len = 16, skip_load = True)
 
 # Initialize draft model if provided, assume it always fits on first device
 
@@ -139,24 +140,34 @@ if args.draft_model_dir:
     else:
         draft_cache = ExLlamaV2Cache(draft_model)
 
+# Load model after draft model
+
+print(" -- Loading model...")
+
+model_init.post_init_load(model, args, allow_auto_split = True)
+
 # Create cache
 
 if args.cache_8bit:
-    cache = ExLlamaV2Cache_8bit(model, lazy = not model.loaded)
+    cache_type = ExLlamaV2Cache_8bit
 elif args.cache_q4:
-    cache = ExLlamaV2Cache_Q4(model, lazy = not model.loaded)
+    cache_type = ExLlamaV2Cache_Q4
 elif args.cache_q6:
-    cache = ExLlamaV2Cache_Q6(model, lazy=not model.loaded)
+    cache_type = ExLlamaV2Cache_Q6
 elif args.cache_q8:
-    cache = ExLlamaV2Cache_Q8(model, lazy = not model.loaded)
+    cache_type = ExLlamaV2Cache_Q8
 else:
-    cache = ExLlamaV2Cache(model, lazy = not model.loaded)
+    cache_type = ExLlamaV2Cache
+
+if model.tp_context:
+    cache = ExLlamaV2Cache_TP(model, base = cache_type)
+else:
+    cache = cache_type(model, lazy = not model.loaded)
 
 # Load model now if auto split enabled
 
 if not model.loaded:
 
-    print(" -- Loading model...")
     model.load_autosplit(cache)
 
 # Chat context
@@ -235,7 +246,9 @@ min_space_in_context = args.response_chunk
 
 # Stop conditions
 
-generator.set_stop_conditions(prompt_format.stop_conditions(tokenizer))
+sc = prompt_format.stop_conditions(tokenizer)
+sc = [x for x in sc if x]
+generator.set_stop_conditions(sc)
 
 # ANSI color codes
 
@@ -393,8 +406,9 @@ while True:
         else:
             sd_stats = ""
 
+        ctx_tokens = active_context.shape[-1]
         print()
-        print(col_sysprompt + f"(Response: {response_tokens} tokens, {speed:.2f} tokens/second{sd_stats})" + col_default)
+        print(col_sysprompt + f"(Context: {ctx_tokens} tokens, response: {response_tokens} tokens, {speed:.2f} tokens/second{sd_stats})" + col_default)
 
     # Optionally forget context after each response
 

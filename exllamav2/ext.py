@@ -39,6 +39,8 @@ def maybe_set_arch_list_env():
         arch = f'{capability[0]}.{capability[1]}'
         if arch not in arch_list:
             arch_list.append(arch)
+    if not arch_list:
+        return
     arch_list = sorted(arch_list)
     arch_list[-1] += '+PTX'
 
@@ -171,9 +173,9 @@ if build_jit:
     # gcc / cl.exe flags
 
     if windows:
-        extra_cflags = ["/Ox"]
+        extra_cflags = ["/Ox", "/openmp"]
     else:
-        extra_cflags = ["-Ofast"]
+        extra_cflags = ["-Ofast", "-fopenmp"]
 
     if ext_debug:
         extra_cflags += ["-ftime-report", "-DTORCH_USE_CUDA_DSA"]
@@ -213,6 +215,9 @@ if build_jit:
         "ext_rope.cpp",
         "ext_safetensors.cpp",
         "ext_sampling.cpp",
+        "ext_element.cpp",
+        "ext_tp.cpp",
+        "cuda/graph.cu",
         "cuda/h_add.cu",
         "cuda/h_gemm.cu",
         "cuda/lora.cu",
@@ -228,6 +233,8 @@ if build_jit:
         "cuda/rope.cu",
         "cuda/cache.cu",
         "cuda/util.cu",
+        "cuda/softcap.cu",
+        "cuda/tp.cu",
         "cuda/comp_units/kernel_select.cu",
         "cuda/comp_units/unit_gptq_1.cu",
         "cuda/comp_units/unit_gptq_2.cu",
@@ -318,22 +325,23 @@ def make_q_matrix(w: dict,
                   temp_dq: torch.Tensor,
                   key: str = None,
                   prescale: float = 1,
-                  max_dq_rows = 0):
+                  max_dq_rows = 0,
+                  offset_qzeros: bool = False):
 
     # EXL2
 
     if "q_weight" in w:
 
         w["q_scale_max"] *= prescale / 256
-        w["q_perm"] = w["q_perm"].short()
-        w["q_invperm"] = w["q_invperm"].short()
+        if "q_perm" in w: w["q_perm"] = w["q_perm"].short()
+        if "q_invperm" in w: w["q_invperm"] = w["q_invperm"].short()
 
         if "q_group_map" not in w:
             w["q_group_map"] = make_group_map(w["q_groups"], w["q_weight"].shape[0])
 
         return ext_c.make_q_matrix(w["q_weight"],
-                                   w["q_perm"],
-                                   w["q_invperm"],
+                                   w.get("q_perm", none_tensor),
+                                   w.get("q_invperm", none_tensor),
                                    w["q_scale"],
                                    w["q_scale_max"],
                                    w["q_groups"],
@@ -351,6 +359,9 @@ def make_q_matrix(w: dict,
 
         if prescale != 1: w["scales"] *= prescale
         if w["scales"].dtype == torch.float: w["scales"] = w["scales"].half()
+
+        if offset_qzeros:
+            w["qzeros"] -= 0b00010001000100010001000100010001
 
         # GPTQ with g_idx (act_order)
 

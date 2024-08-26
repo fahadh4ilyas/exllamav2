@@ -16,7 +16,7 @@
 #include "cuda/head_norm.cuh"
 
 #include "cpp/util.h"
-
+#include "ext_tp.h"
 
 // RMS layernorm
 
@@ -28,9 +28,9 @@ void rms_norm
     float epsilon
 )
 {
-    TORCH_CHECK_DTYPE(x, kHalf);
+    bool input_fp32 = x.dtype() == torch::kFloat;
+    bool output_fp32 = y.dtype() == torch::kFloat;
     TORCH_CHECK_DTYPE(w, kHalf);
-    TORCH_CHECK_DTYPE(y, kHalf);
     TORCH_CHECK_SHAPES(x, 1, w, 0, 1);
     TORCH_CHECK_SHAPES(x, 0, y, 0, 1);
     TORCH_CHECK_SHAPES(x, 1, y, 1, 1);
@@ -39,16 +39,57 @@ void rms_norm
     int dim = x.size(1);
 
     const at::cuda::OptionalCUDAGuard device_guard(device_of(x));
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
     rms_norm_cuda
     (
-        (half*) x.data_ptr(),
+        stream,
+        (void*) x.data_ptr(),
         (half*) w.data_ptr(),
-        (half*) y.data_ptr(),
+        (void*) y.data_ptr(),
         epsilon,
         rows,
-        dim
+        dim,
+        false,
+        input_fp32,
+        output_fp32
     );
+}
+
+void rms_norm_tp
+(
+    std::vector<torch::Tensor> x,
+    std::vector<torch::Tensor> w,
+    std::vector<torch::Tensor> y,
+    float epsilon,
+    uintptr_t tp_context
+)
+{
+    ExtTPContext* ctx = reinterpret_cast<ExtTPContext*> (tp_context);
+
+    int rows = x[0].size(0);
+    int dim = x[0].size(1);
+
+    for (int i = 0; i < x.size(); ++i)
+    {
+        int dev = x[i].device().index();
+//        DBGI(dev);
+//        DBGI(ctx->streams[dev]);
+        cudaSetDevice(dev);
+        rms_norm_cuda
+        (
+            ctx->streams[dev],
+            (void*) x[i].data_ptr(),
+            (half*) w[i].data_ptr(),
+            (void*) y[i].data_ptr(),
+            epsilon,
+            rows,
+            dim,
+            false,
+            false,  // TODO: FP32 residual
+            false
+        );
+    }
 }
 
 void rms_norm_
@@ -86,9 +127,11 @@ void layer_norm
     int dim = x.size(1);
 
     const at::cuda::OptionalCUDAGuard device_guard(device_of(x));
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
     layer_norm_cuda
     (
+        stream,
         (half*) x.data_ptr(),
         (half*) w.data_ptr(),
         b.device().is_meta() ? NULL : (half*) b.data_ptr(),
@@ -138,9 +181,11 @@ void head_norm
     int rows = x.numel() / head_dim / num_heads;
 
     const at::cuda::OptionalCUDAGuard device_guard(device_of(x));
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
     head_norm_cuda
     (
+        stream,
         (half*) x.data_ptr(),
         (half*) w.data_ptr(),
         b.device().is_meta() ? NULL : (half*) b.data_ptr(),

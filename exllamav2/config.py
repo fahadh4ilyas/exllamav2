@@ -10,7 +10,9 @@ from typing import Any, Dict, List, TypeVar, Union, cast
 T = TypeVar('T')
 no_default = object()
 
-def read(input_dict: dict[str, Any], expected_type: type, keys: str | list[str], default = no_default) -> T:
+def read(input_dict: dict[str, Any], expected_type: type | list[type], keys: str | list[str], default = no_default) -> T:
+
+    expected_types = expected_type if isinstance(expected_type, list) else [expected_type]
 
     if isinstance(keys, str): keys = [keys]
 
@@ -34,10 +36,10 @@ def read(input_dict: dict[str, Any], expected_type: type, keys: str | list[str],
             if expected_type == int and isinstance(x, float) and x == int(x):
                 x = int(x)
 
-            if isinstance(x, expected_type):
-                return cast(T, x)
-            else:
-                raise TypeError(f"Value for {key} is not of expected type {expected_type}")
+            for t in expected_types:
+                if isinstance(x, t):
+                    return cast(T, x)
+            raise TypeError(f"Value for {key} is not of expected type {expected_type}")
 
     if default != no_default: return default
     raise ValueError(f"Missing any of the following keys: {keys}")
@@ -61,6 +63,7 @@ class ExLlamaV2Config:
     no_sdpa: bool                               # Do not use Torch SDPA even if causal_lower_right bias is available (seems to be unreliable on ROCm (?))
     fasttensors: bool                           # Use alternative .safetensors loader (aio on Linux, cstdio on Windows). Not always faster but can address excessive use of system RAM in some situations
     load_in_q4: bool                            # Load float linear layers in Q4 format (for test/dev purposes, not performant)
+    no_graphs: bool                             # Do not use CUDA graphs
 
     max_dq_size: int                            # Max number of elements to dequantize at once
 
@@ -100,8 +103,17 @@ class ExLlamaV2Config:
     scale_depth: float
     scale_emb: float
     use_qk_norm: bool
-
+    query_pre_attn_scalar: float | None
+    final_logit_softcapping: float | None
+    attn_logit_softcapping: float | None
+    sliding_window: int
+    norm_head: int | None
+    l3_rope_factor: float | None
+    l3_rope_low_freq_factor: float | None
+    l3_rope_high_freq_factor: float | None
+    l3_rope_original_max_position_embeddings: int | None
     checkpoint_fused_mlp: bool
+    checkpoint_offset_qzeros: bool
 
 
     def __init__(self,
@@ -126,6 +138,7 @@ class ExLlamaV2Config:
         self.no_sdpa = 'EXLLAMA_NO_SDPA' in os.environ
         self.fasttensors = 'EXLLAMA_FASTTENSORS' in os.environ
         self.load_in_q4 = False
+        self.no_graphs = 'EXLLAMA_NO_GRAPHS' in os.environ
 
         if model_dir is not None:
             self.model_dir = model_dir
@@ -162,9 +175,9 @@ class ExLlamaV2Config:
 
         # Load generation_config.json
 
-        self.generation_config_path = os.path.join(self.model_dir, "generation_config.json")
-        if os.path.exists(self.generation_config_path):
-            with open(self.generation_config_path, encoding = "utf8") as f:
+        generation_config_path = os.path.join(self.model_dir, "generation_config.json")
+        if os.path.exists(generation_config_path):
+            with open(generation_config_path, encoding = "utf8") as f:
                 gen_config = json.load(f)
                 self.generation_config = {}
                 try:
@@ -175,8 +188,7 @@ class ExLlamaV2Config:
                         self.generation_config['eos_token_id'] = [eos_token_id_as_int]
                     else:
                         self.generation_config['eos_token_id'] = None
-                    
-        
+
         # Model architecture
 
         assert len(read_config["architectures"]) == 1, "Multiple architectures defined in config.json"
@@ -186,9 +198,12 @@ class ExLlamaV2Config:
         # Vocab params
 
         self.bos_token_id = read(read_config, int, "bos_token_id", None)  # 1
-        self.eos_token_id = read(read_config, int, "eos_token_id", None)  # 2
+        self.eos_token_id = read(read_config, [int, list], "eos_token_id", None)  # 2
         self.pad_token_id = read(read_config, int, "pad_token_id", None)  # 0
         self.vocab_size = read(read_config, int, "vocab_size")
+
+        if isinstance(self.eos_token_id, list):
+            self.eos_token_id = self.eos_token_id[0]  # TODO: Figure out a way to maybe use all the EOS tokens somehow
 
         # Standard params
 
@@ -218,6 +233,8 @@ class ExLlamaV2Config:
         self.num_key_value_groups = self.num_attention_heads // self.num_key_value_heads
         self.use_qk_norm = read(read_config, bool, ["use_qk_norm"], False)
 
+        self.query_pre_attn_scalar = read(read_config, float, "query_pre_attn_scalar", None)
+
         # MLP params
 
         if self.arch.default_inner_dim_mult is not None:
@@ -243,6 +260,13 @@ class ExLlamaV2Config:
         else:
             self.scale_depth = scale_depth / math.sqrt(self.num_hidden_layers)
 
+        self.attn_logit_softcapping = read(read_config, float, "attn_logit_softcapping", None)
+        self.final_logit_softcapping = read(read_config, float, "final_logit_softcapping", None)
+
+        # Normalize weights in head layer
+
+        self.norm_head = read(read_config, int, "norm_head", None)
+
         # Positional embeddings
 
         self.rotary_embedding_base = read(read_config, float, ["rope_theta", "attn_config->rope_theta"], 10000.0)
@@ -254,13 +278,15 @@ class ExLlamaV2Config:
                                                   "n_positions"], 2048)
         self.original_max_seq_len = self.max_seq_len
 
+        self.sliding_window = read(read_config, int, ["sliding_window", "sliding_window_size"], 0)
+
         rs = read(read_config, dict, "rope_scaling", None)
         if rs:
             scaling_type = rs.get("type", None)
             if scaling_type == "linear":
                 assert "factor" in rs, "'factor' missing from 'rope_scaling' config"
                 self.scale_pos_emb = rs.get("factor", 1.0)
-            if scaling_type == "su":
+            if scaling_type == "su" or scaling_type == "longrope":
                 assert "long_factor" in rs, "'long_factor' missing from 'rope_scaling' config"
                 assert "short_factor" in rs, "'short_factor' missing from 'rope_scaling' config"
                 assert "original_max_position_embeddings" in read_config, \
@@ -271,6 +297,18 @@ class ExLlamaV2Config:
                 self.alt_rope_method = "su"
             # if scaling_type == "yarn":
             #     self.scale_alpha_value = factor
+            rope_type = rs.get("rope_type", None)
+            if rope_type == "llama3":
+                self.alt_rope_method = "llama3"
+                self.l3_rope_factor = rs["factor"]
+                self.l3_rope_low_freq_factor = rs["low_freq_factor"]
+                self.l3_rope_high_freq_factor = rs["high_freq_factor"]
+                self.l3_rope_original_max_position_embeddings = rs["original_max_position_embeddings"]
+
+        # Checkpoint format (for GPTQ models)
+
+        checkpoint_format = read(read_config, str, ["quantization_config->checkpoint_format"], None)
+        self.checkpoint_offset_qzeros = (checkpoint_format == "gptq_v2")
 
         # Create map of model tensors
 
@@ -333,3 +371,53 @@ class ExLlamaV2Config:
                 raise ValueError(f" ## Could not find {prefix}.* in model")
 
         x = 0
+
+
+    def arch_compat_overrides(self, quiet: bool = False, warn_only = False):
+
+        from exllamav2.attn import (
+            has_flash_attn,
+            has_flash_attn_with_window,
+            has_flash_attn_with_softcap,
+            has_xformers
+        )
+
+        warnings = []
+
+        if self.arch.eager_attn_only:
+            warnings.append(" !! Warning: Architecture currently supports only eager attention")
+            if not warn_only:
+                warnings.append(" !! Warning: flash-attn, xformers and SDPA are disabled")
+                self.no_flash_attn = True
+                self.no_xformers = True
+                self.no_sdpa = True
+            else:
+                warnings.append(" !! Warning: flash-attn, xformers and SDPA should be disabled for correct inference")
+
+        if has_flash_attn and not self.no_flash_attn:
+            disable = False
+            if self.attn_logit_softcapping and not has_flash_attn_with_softcap:
+                warnings.append(" !! Warning: model requires softcap, not supported in installed version of flash-attn")
+                disable = True
+            if (self.arch.swa or self.arch.alternating_swa) and not has_flash_attn_with_window:
+                warnings.append(" !! Warning: model requires SWA, not supported in installed version of flash-attn")
+                disable = True
+            if disable and not warn_only:
+                warnings.append(" !! Warning: disabling flash-attn")
+                self.no_flash_attn = True
+
+        if has_xformers and not self.no_xformers:
+            disable = False
+            if self.attn_logit_softcapping:
+                warnings.append(" !! Warning: model requires softcap, not supported in xformers")
+                disable = True
+            if self.arch.swa or self.arch.alternating_swa:
+                warnings.append(" !! Warning: model requires SWA, not supported in xformers")
+                disable = True
+            if disable and not warn_only:
+                warnings.append(" !! Warning: disabling xformers")
+                self.no_xformers = True
+
+        if not quiet:
+            for w in warnings:
+                print(w)

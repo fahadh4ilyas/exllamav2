@@ -20,7 +20,7 @@ class ExLlamaV2Module:
     config: ExLlamaV2Config
     key: str
     alt_key: str | None
-    device_idx: int
+    device_idx: int | list
     footprint: int
     submodules: list[ExLlamaV2Module]
     assumed_footprint: int
@@ -37,9 +37,10 @@ class ExLlamaV2Module:
 
 
     def numel(self): raise(NotImplementedError())
-    def load(self): raise(NotImplementedError())
+    def load(self, device_context: bool): raise(NotImplementedError())
     def unload(self): raise(NotImplementedError())
     def scratch_space_fixed(self): raise(NotImplementedError())
+    def scratch_space_tp(self): raise(NotImplementedError())
     def scratch_space(self): raise(NotImplementedError())
 
     def forward(self,
@@ -126,13 +127,13 @@ class ExLlamaV2Module:
                     bias = tensors["bias"].half()
                     if self.model.config.arch.orig_weights_transposed and len(tensor.shape) == 2:
                         tensor = tensor.T
-                    return nn.Parameter(tensor), nn.Parameter(bias)
+                    return nn.Parameter(tensor, requires_grad = False), nn.Parameter(bias, requires_grad = False)
                 else:
                     tensors = self.load_multi(key, ["weight"])
                     tensor = tensors["weight"].half()
                     # if self.model.config.arch.orig_weights_transposed:
                     #     tensor = tensor.T
-                    return nn.Parameter(tensor)
+                    return nn.Parameter(tensor, requires_grad = False)
 
             # No weights found for key
 
@@ -144,27 +145,43 @@ class ExLlamaV2Module:
                           f_beg: int,
                           f_end: int,
                           in_feat: int,
-                          out_feat: int):
+                          out_feat: int,
+                          altpack_qkv: bool):
 
         res = []
         for key in [f_key, f_key + ".weight", f_key + ".bias"]:
 
-            filename = self.model.config.tensor_file_map.get(key)
+            cfg = self.model.config
+            filename = cfg.tensor_file_map.get(key)
             if not filename: continue
 
-            stfile = STFile.open(filename, fast = self.model.config.fasttensors, keymap = self.model.config.arch.keymap)
+            stfile = STFile.open(filename, fast = cfg.fasttensors, keymap = cfg.arch.keymap)
             # tensor = stfile.get_tensor(key, device = self.device()).half()
             tensor = stfile.get_tensor(key, device = "cpu", cached = True, out_dtype = torch.half)
-            if self.model.config.arch.orig_weights_transposed and len(tensor.shape) == 2:
+
+            if cfg.arch.orig_weights_transposed and len(tensor.shape) == 2:
                 tensor = tensor.T
+
+            if altpack_qkv:
+                ts = tensor.shape
+                h, gs, d = cfg.num_key_value_heads, cfg.num_key_value_groups + 2, cfg.head_dim
+                tensor = tensor.view(h, gs, d, -1).transpose(0, 1).reshape(ts)
+
             tensor = tensor[f_beg:f_end]
+
+            if altpack_qkv:
+                ts = tensor.shape
+                h, gs, d = cfg.num_key_value_heads, (f_end - f_beg) // cfg.num_key_value_heads // cfg.head_dim, cfg.head_dim
+                tensor = tensor.view(gs, h, d, -1).transpose(0, 1).reshape(ts)
+
             if not key.endswith(".bias"):
                 if in_feat != out_feat and \
                     tensor.shape[1] == out_feat and \
                     tensor.shape[0] == in_feat:
                     tensor = tensor.T
+
             tensor = tensor.contiguous().to(self.device())
-            res.append(nn.Parameter(tensor))
+            res.append(nn.Parameter(tensor, requires_grad = False))
 
         if len(res) == 2: return res[0], res[1]
         if len(res) == 1: return res[0]
@@ -207,7 +224,7 @@ class ExLlamaV2Module:
         return self.footprint
 
 
-    def set_device_idx(self, idx: int):
+    def set_device_idx(self, idx: int | None):
         self.device_idx = idx
 
 
@@ -238,6 +255,7 @@ class Intervention(ExLlamaV2Module):
     def load(self): return self.inner.load()
     def unload(self): return self.inner.unload()
     def scratch_space_fixed(self): return self.inner.scratch_space_fixed()
+    def scratch_space_tp(self): return self.inner.scratch_space_fixed()
     def scratch_space(self): return self.inner.scratch_space()
     def device(self): return self.inner.device()
     def set_device_idx(self, idx: int): raise NotImplementedError()

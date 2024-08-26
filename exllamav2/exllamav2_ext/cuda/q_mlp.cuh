@@ -8,6 +8,28 @@
 #include <ATen/cuda/CUDAContext.h>
 
 #include "q_matrix.cuh"
+#include "graph.cuh"
+
+struct QMLP_params_const
+{
+    int rows;
+    int columns;
+
+    bool operator==(const QMLP_params_const& other) const
+    {
+        return rows == other.rows &&
+               columns == other.columns;
+    }
+};
+
+struct QMLP_params_const_hash
+{
+    std::size_t operator()(const QMLP_params_const& key) const
+    {
+        return (std::hash<int>()(key.rows)) ^
+               (std::hash<int>()(key.columns) << 1);
+    }
+};
 
 class QMLP
 {
@@ -15,6 +37,8 @@ public:
 
     half* layernorm;
     half* layernorm_bias;
+    half* post_layernorm;
+    half* post_layernorm_bias;
     bool layernorm_is_rms;
     float norm_epsilon;
 
@@ -36,11 +60,15 @@ public:
 
     bool act_gelu;
     bool has_residual;
+    bool residual_fp32;
+
+    bool use_graphs;
+    std::unordered_map<QMLP_params_const, Graph*, QMLP_params_const_hash> graph_map;
 
     QMLP
     (
         half* _layernorm,
-        half* _layermorm_bias,
+        half* _layernorm_bias,
         bool _layernorm_is_rms,
         float _norm_epsilon,
         QMatrix* _gate,
@@ -52,24 +80,43 @@ public:
         half* _temp_dq,
         int _max_rows,
         bool _act_gelu,
-        bool _has_residual
+        bool _has_residual,
+        half* _post_layernorm,
+        half* _post_layernorm_bias,
+        bool _residual_fp32,
+        bool _use_graphs
     );
 
     ~QMLP();
 
     void forward_
     (
+        cudaStream_t stream,
         cublasHandle_t cublas_handle,
-        half* x,
+        void* x,
         int rows,
         int columns,
         const std::vector<uintptr_t>& loras,
         half* lora_temp
     );
 
+    void forward_run_
+    (
+        cudaStream_t stream,
+        cublasHandle_t cublas_handle,
+        void* x,
+        int rows,
+        int columns,
+        const std::vector<uintptr_t>& loras,
+        half* lora_temp,
+        Graph* graph = NULL
+    );
+
 private:
 
 };
+
+// ---------------------------------------------------------------------------------
 
 class QMoEMLP
 {
@@ -108,7 +155,7 @@ public:
     QMoEMLP
     (
         half* _layernorm,
-        half* _layermorm_bias,
+        half* _layernorm_bias,
         bool _layernorm_is_rms,
         float _norm_epsilon,
         half* _gate,
@@ -132,6 +179,7 @@ public:
 
     void forward_
     (
+        cudaStream_t stream,
         cublasHandle_t cublas_handle,
         half* x,
         int rows,
@@ -143,5 +191,17 @@ public:
 private:
 
 };
+
+// ---------------------------------------------------------------------------------
+
+void act_mul_cuda
+(
+    cudaStream_t stream,
+    half* gate,
+    half* up,
+    int rows,
+    int dim,
+    bool act_gelu
+);
 
 #endif

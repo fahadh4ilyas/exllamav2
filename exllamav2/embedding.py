@@ -18,18 +18,26 @@ class ExLlamaV2Embedding(ExLlamaV2Module):
     embedding: nn.Embedding | None
     native_vocab_size: int | None
 
+    is_tp: bool
 
     def __init__(self,
                  model: ExLlamaV2,
                  key: str):
         super().__init__(model, key)
 
+        self.is_tp = False
+
         self.native_vocab_size = None
         self.embedding = None
 
 
+    def tp_split(self):
+
+        self.is_tp = True
+
+
     @torch.inference_mode
-    def load(self):
+    def load(self, device_context: bool = True):
 
         vocab_size = self.model.config.vocab_size
         hidden_size = self.model.config.hidden_size
@@ -75,6 +83,11 @@ class ExLlamaV2Embedding(ExLlamaV2Module):
         return 0
 
 
+    def scratch_space_tp(self) -> list[int]:
+
+        return [0] * self.model.tp_context.num_devices
+
+
     def scratch_space(self) -> int:
 
         return 0
@@ -88,6 +101,8 @@ class ExLlamaV2Embedding(ExLlamaV2Module):
                 intermediates: bool = False,
                 loras = None,
                 **kwargs) -> torch.Tensor | dict[str: torch.Tensor]:
+
+        cfg = self.model.config
 
         # If input IDs contain negative values, assume they are padding tokens from a model with not pad_token_id
         # defined
@@ -111,7 +126,7 @@ class ExLlamaV2Embedding(ExLlamaV2Module):
             # Create combined tensor on the target device
 
             batch_size, seq_len = input_ids.shape
-            hidden_size = self.model.config.hidden_size
+            hidden_size = cfg.hidden_size
             combined_embeddings = torch.empty(batch_size, seq_len, hidden_size,
                                               device = indexed_embeddings.device,
                                               dtype = indexed_embeddings.dtype)
@@ -133,8 +148,10 @@ class ExLlamaV2Embedding(ExLlamaV2Module):
 
             # Normalization
 
-            if self.model.config.arch.normalize_embeddings:
-                combined_embeddings *= self.model.config.hidden_size ** 0.5
+            if cfg.arch.residual_stream_fp32:
+                combined_embeddings = combined_embeddings.float()
+            if cfg.arch.normalize_embeddings:
+                combined_embeddings *= cfg.hidden_size ** 0.5
 
             # Extract indexed embeddings and insert in-place
 
@@ -152,8 +169,16 @@ class ExLlamaV2Embedding(ExLlamaV2Module):
             else:
                 hidden_states = self.embedding(hidden_states)
 
-            if self.model.config.arch.normalize_embeddings:
-                hidden_states *= self.model.config.hidden_size ** 0.5
+            if cfg.arch.residual_stream_fp32:
+                hidden_states = hidden_states.float()
+            if cfg.arch.normalize_embeddings:
+                hidden_states *= cfg.hidden_size ** 0.5
+
+        # Move to pinned temp buffer for TP
+
+        if self.is_tp:
+            ctx = self.model.tp_context
+            hidden_states = ctx.copy_pinned(0, hidden_states)
 
         if intermediates:
             return {"hidden_states": hidden_states}

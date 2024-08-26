@@ -7,6 +7,7 @@ from exllamav2 import(
     ExLlamaV2Cache_Q4,
     ExLlamaV2Cache_Q6,
     ExLlamaV2Cache_Q8,
+    ExLlamaV2Cache_TP,
     ExLlamaV2Tokenizer,
     model_init,
 )
@@ -50,6 +51,7 @@ parser.add_argument("-e8", "--eval_token_8bit", action = "store_true", help = "E
 parser.add_argument("-eq4", "--eval_token_q4", action = "store_true", help = "Evaluate perplexity on token-by-token inference using Q4 cache")
 parser.add_argument("-eq6", "--eval_token_q6", action = "store_true", help = "Evaluate perplexity on token-by-token inference using Q6 cache")
 parser.add_argument("-eq8", "--eval_token_q8", action = "store_true", help = "Evaluate perplexity on token-by-token inference using Q8 cache")
+parser.add_argument("-ecl", "--eval_context_lens", action = "store_true", help = "Evaluate perplexity at range of context lengths")
 # parser.add_argument("-eb", "--eval_bos", action = "store_true", help = "Add BOS token to every row in perplexity test (required by Gemma and maybe other models.)")
 parser.add_argument("-p", "--prompt", type = str, help = "Generate from prompt (basic sampling settings)")
 parser.add_argument("-pnb", "--prompt_no_bos", action = "store_true", help = "Don't add BOS token to prompt")
@@ -83,6 +85,9 @@ if args.stream_layers:
     if args.gpu_split:
         print(" ## Can only use one GPU when streaming layers")
         sys.exit()
+    if args.eval_context_lens and args.stream_layers:
+        print(" ## eval_context_lens not compatible with stream_layers")
+        sys.exit()
     if args.eval_dataset:
         if args.length and args.eval_length != args.length:
             print(" !! Overriding model context length to match eval row length")
@@ -92,11 +97,14 @@ if args.stream_layers:
 
 model_init.check_args(args)
 model_init.print_options(args)
-model, tokenizer = model_init.init(args,
-                                   allow_auto_split = True,
-                                   skip_load = args.stream_layers,
-                                   benchmark = True,
-                                   max_output_len = args.max_output_len)
+model, tokenizer = model_init.init(
+    args,
+    allow_auto_split = True,
+    skip_load = args.stream_layers,
+    benchmark = True,
+    max_output_len = args.max_output_len,
+    progress = True
+)
 cache = None
 
 # Auto split
@@ -109,7 +117,7 @@ if not model.loaded and not args.stream_layers:
     print(" -- Loading model...")
     cache = ExLlamaV2Cache(model, lazy = True)
     t = time.time()
-    model.load_autosplit(cache)
+    model.load_autosplit(cache, progress = True)
     t = time.time() - t
     print(f" -- Loaded model in {t:.4f} seconds")
 
@@ -181,7 +189,7 @@ if args.prompt:
     with torch.inference_mode():
 
         if cache is None:
-            cache = ExLlamaV2Cache(model)
+            cache = ExLlamaV2Cache(model) if not model.tp_context else ExLlamaV2Cache_TP(model)
 
         ids = tokenizer.encode(args.prompt)
         tokens_prompt = ids.shape[-1]
@@ -279,13 +287,25 @@ if args.eval_dataset or args.standard_perplexity:
                 boss = torch.full((eval_tokens.shape[0], 1), tokenizer.bos_token_id, dtype = torch.long)
                 eval_tokens = torch.cat((boss, eval_tokens[:, :-1]), dim = 1)
 
-        logprob_sum = 0.0
-        logprob_count = 0
+        if args.eval_context_lens:
+            logprob_sum = []
+            logprob_count = []
+        else:
+            logprob_sum = 0.0
+            logprob_count = 0
 
-        def ppl(input_ids__, logits__, lengths__):
+        def ppl(input_ids__, logits__, lengths__, bins = False):
 
-            logprob_sum_ = 0.0
-            logprob_count_ = 0
+            logits_device = model.modules[-1].device() if not model.tp_context else \
+                            torch.device(model.tp_context.device)
+
+            if bins:
+                num_bins = (max(lengths__) + 255) // 256
+                logprob_sum_ = [0.0] * num_bins
+                logprob_count_ = [0] * num_bins
+            else:
+                logprob_sum_ = 0.0
+                logprob_count_ = 0
 
             assert logits__.shape[0] == input_ids__.shape[0]
             ll = logits__.shape[1]
@@ -295,19 +315,28 @@ if args.eval_dataset or args.standard_perplexity:
                 logits_ = logits__[bi:bi+1, cl:, :]
                 input_ids_ = input_ids__[bi:bi+1, cl:]
 
-                chunksize = logits_.shape[1] * 4000 // logits_.shape[2] + 1
+                if bins:
+                    chunksize = 256
+                else:
+                    chunksize = logits_.shape[1] * 4000 // logits_.shape[2] + 1
                 b_ = 0
                 while b_ < logits_.shape[1]:
                     a_ = b_
                     b_ = min(b_ + chunksize, logits_.shape[1])
 
-                    logits_f = logits_[:, a_:b_, :].float() + 1e-10
-                    target_ids = input_ids_[:, a_ + 1:b_ + 1].to(logits_.device)
+                    logits_f = logits_[:, a_:b_, :].to(logits_device).float() + 1e-10
+                    target_ids = input_ids_[:, a_ + 1:b_ + 1].to(logits_f.device)
 
                     log_probs = F.log_softmax(logits_f, dim=-1)
                     token_log_probs = log_probs.gather(-1, target_ids.unsqueeze(-1)).squeeze(-1)
-                    logprob_sum_ += token_log_probs.sum().item()
-                    logprob_count_ += target_ids.numel()
+                    if bins:
+                        # for cbin in range(a_ // 256 + 1):
+                        cbin = a_ // 256
+                        logprob_sum_[cbin] += token_log_probs.sum().item()
+                        logprob_count_[cbin] += target_ids.numel()
+                    else:
+                        logprob_sum_ += token_log_probs.sum().item()
+                        logprob_count_ += target_ids.numel()
 
             return logprob_sum_, logprob_count_
 
@@ -365,7 +394,10 @@ if args.eval_dataset or args.standard_perplexity:
             sys.stdout.flush()
 
             if cache is None:
-                cache = ExLlamaV2Cache(model, max_seq_len = eval_length) if eval_length > model.config.max_input_len else None
+                if eval_length > model.config.max_input_len:
+                    cache = ExLlamaV2Cache(model, max_seq_len = eval_length) if not model.tp_context else ExLlamaV2Cache_TP(model, max_seq_len = eval_length)
+                else:
+                    cache = None
 
             for i in range(eval_tokens.shape[0]):
 
@@ -376,18 +408,33 @@ if args.eval_dataset or args.standard_perplexity:
 
                 input_ids = input_ids[:, :]
                 if cache is not None: cache.current_seq_len = 0
-                logits = model.forward(input_ids, cache)
+                logits = model.forward(input_ids, cache, cpu_logits = input_ids.numel() > 2048)
                 logits = logits[:, :-1, :]
 
-                logprob_sum__, logprob_count__ = ppl(input_ids, logits, eval_len[i:i+1])
-                logprob_sum += logprob_sum__
-                logprob_count += logprob_count__
+                logprob_sum__, logprob_count__ = ppl(input_ids, logits, eval_len[i:i+1], args.eval_context_lens)
+                if args.eval_context_lens:
+                    while len(logprob_sum) < len(logprob_sum__):
+                        logprob_sum.append(0.0)
+                        logprob_count.append(0)
+                    for j in range(len(logprob_sum__)):
+                        logprob_sum[j] += logprob_sum__[j]
+                        logprob_count[j] += logprob_count__[j]
+                else:
+                    logprob_sum += logprob_sum__
+                    logprob_count += logprob_count__
 
-        print()
-
-        mean_log_prob = logprob_sum / logprob_count
-        perplexity = math.exp(-mean_log_prob)
-        print(f" -- Evaluation perplexity: {perplexity:.4f}")
+        if not args.eval_context_lens:
+            print()
+            mean_log_prob = logprob_sum / logprob_count
+            perplexity = math.exp(-mean_log_prob)
+            print(f" -- Evaluation perplexity: {perplexity:.4f}")
+        else:
+            print()
+            for j in range(len(logprob_sum__)):
+                mean_log_prob = logprob_sum[j] / logprob_count[j]
+                perplexity = math.exp(-mean_log_prob)
+                dl = min((j + 1) * 256, eval_length)
+                print(f" -- Evaluation perplexity: {dl} {perplexity:.4f}")
 
         def test_ppl_token():
             global logprob_sum, logprob_count, i, input_ids
@@ -431,7 +478,8 @@ if args.eval_dataset or args.standard_perplexity:
             else:
                 print(f" -- Inference (token)", end = "")
                 sys.stdout.flush()
-                cache = ExLlamaV2Cache(model, max_seq_len = eval_length)
+                cache = ExLlamaV2Cache(model, max_seq_len = eval_length) if not model.tp_context else \
+                        ExLlamaV2Cache_TP(model, max_seq_len = eval_length)
                 test_ppl_token()
 
         if args.eval_token_8bit:
@@ -440,7 +488,8 @@ if args.eval_dataset or args.standard_perplexity:
             else:
                 print(f" -- Inference (token, 8-bit cache)", end = "")
                 sys.stdout.flush()
-                cache = ExLlamaV2Cache_8bit(model, max_seq_len = eval_length)
+                cache = ExLlamaV2Cache_8bit(model, max_seq_len = eval_length) if not model.tp_context else \
+                        ExLlamaV2Cache_TP(model, max_seq_len = eval_length, base = ExLlamaV2Cache_8bit)
                 test_ppl_token()
 
         if args.eval_token_q4:
@@ -449,7 +498,8 @@ if args.eval_dataset or args.standard_perplexity:
             else:
                 print(f" -- Inference (token, Q4 cache)", end = "")
                 sys.stdout.flush()
-                cache = ExLlamaV2Cache_Q4(model, max_seq_len = eval_length)
+                cache = ExLlamaV2Cache_Q4(model, max_seq_len = eval_length) if not model.tp_context else \
+                        ExLlamaV2Cache_TP(model, max_seq_len = eval_length, base = ExLlamaV2Cache_Q4)
                 # cache.calibrate(tokenizer)
                 test_ppl_token()
 
@@ -459,7 +509,8 @@ if args.eval_dataset or args.standard_perplexity:
             else:
                 print(f" -- Inference (token, Q6 cache)", end = "")
                 sys.stdout.flush()
-                cache = ExLlamaV2Cache_Q6(model, max_seq_len = eval_length)
+                cache = ExLlamaV2Cache_Q6(model, max_seq_len = eval_length) if not model.tp_context else \
+                        ExLlamaV2Cache_TP(model, max_seq_len = eval_length, base = ExLlamaV2Cache_Q6)
                 # cache.calibrate(tokenizer)
                 test_ppl_token()
 
@@ -469,7 +520,8 @@ if args.eval_dataset or args.standard_perplexity:
             else:
                 print(f" -- Inference (token, Q8 cache)", end = "")
                 sys.stdout.flush()
-                cache = ExLlamaV2Cache_Q8(model, max_seq_len = eval_length)
+                cache = ExLlamaV2Cache_Q8(model, max_seq_len = eval_length) if not model.tp_context else \
+                        ExLlamaV2Cache_TP(model, max_seq_len = eval_length, base = ExLlamaV2Cache_Q8)
                 # cache.calibrate(tokenizer)
                 test_ppl_token()
 
@@ -481,7 +533,7 @@ if args.prompt_speed:
     with torch.inference_mode():
 
         if cache is None:
-            cache = ExLlamaV2Cache(model)
+            cache = ExLlamaV2Cache(model) if not model.tp_context else ExLlamaV2Cache_TP(model)
 
         ids = torch.randint(0, model.config.vocab_size - 1, (1, model.config.max_seq_len))
 
@@ -532,7 +584,7 @@ if args.speed:
     with torch.inference_mode():
 
         if cache is None:
-            cache = ExLlamaV2Cache(model)
+            cache = ExLlamaV2Cache(model) if not model.tp_context else ExLlamaV2Cache_TP(model)
         cache.current_seq_len = 0
 
         print(f" -- Measuring token speed...")
@@ -551,6 +603,7 @@ if args.speed:
 
                 logits = model.forward(ids[:, -1:], cache)
                 sample = torch.argmax(logits[0, -1]).cpu().unsqueeze(0).unsqueeze(0)
+                sample.clamp_(0, tokenizer.get_vocab_size() - 1)
                 ids = torch.cat((ids, sample), dim=-1)
 
             time_end = time.time()

@@ -6,6 +6,7 @@ from exllamav2.generator.filters import ExLlamaV2Filter
 from exllamav2.cache import ExLlamaV2CacheBase, ExLlamaV2Cache_8bit
 from exllamav2.attn import ExLlamaV2Attention, assert_paged_attn
 from exllamav2.ext import exllamav2_ext as ext_c, none_tensor
+from exllamav2.util import cuda_sync_active
 from concurrent.futures import ThreadPoolExecutor
 
 from exllamav2.compat import pairwise
@@ -238,10 +239,10 @@ class ExLlamaV2DynamicGenerator:
         model: ExLlamaV2,
         cache: ExLlamaV2CacheBase,
         tokenizer: ExLlamaV2Tokenizer,
-        max_batch_size: int = 16,
+        max_batch_size: int = None,
         max_seq_len: int | None = None,
         max_chunk_size: int | None = None,
-        max_q_size: int = 16,
+        max_q_size: int = 8,
         draft_model: ExLlamaV2 | None = None,
         draft_cache: ExLlamaV2CacheBase | None = None,
         num_draft_tokens: int = 4,
@@ -267,7 +268,7 @@ class ExLlamaV2DynamicGenerator:
 
         :param max_batch_size:
             The maximum number of sequences to process in parallel. The generator will also limit this
-            dynamically considering the available cache space.
+            dynamically considering the available cache space. Specify None to calculate automatically
 
         :param max_seq_len:
             Maximum length of each individual sequence. Defaults to the model's max_seq_len.
@@ -324,7 +325,13 @@ class ExLlamaV2DynamicGenerator:
 
         self.draft_model = draft_model
         self.draft_cache = draft_cache
-        self.num_draft_tokens = num_draft_tokens if (draft_model or use_ngram_draft) else 0
+
+        if draft_model or use_ngram_draft:
+            assert num_draft_tokens <= max_q_size, \
+                "num_draft_tokens cannot be larger than max_q_size."
+            self.num_draft_tokens = num_draft_tokens
+        else:
+            self.num_draft_tokens = 0
 
         if draft_model:
             assert draft_cache is not None, \
@@ -343,12 +350,16 @@ class ExLlamaV2DynamicGenerator:
         assert not isinstance(cache, ExLlamaV2Cache_8bit), \
             "Dynamic generator does not currently work with 8-bit cache. Use either FP16 or Q4."
 
-        model_max_q = cfg.max_batch_size * cfg.max_input_len
-        req_max_q = max_q_size * max_batch_size
-        assert req_max_q <= model_max_q, \
-            f"Model has max_batch_size * max_input_len = {cfg.max_batch_size} * {cfg.max_input_len} tokens, " + \
-            f"generator requires max_batch_size * max_q_size = {max_batch_size} * {max_q_size} tokens."
-        self.max_batch_size = max_batch_size
+        if not max_batch_size:
+            max_batch_size = cfg.max_input_len // max_q_size
+            self.max_batch_size = max_batch_size
+        else:
+            model_max_q = cfg.max_batch_size * cfg.max_input_len
+            req_max_q = max_q_size * max_batch_size
+            assert req_max_q <= model_max_q, \
+                f"Model has max_batch_size * max_input_len = {cfg.max_batch_size} * {cfg.max_input_len} tokens, " + \
+                f"generator requires max_batch_size * max_q_size = {max_batch_size} * {max_q_size} tokens."
+            self.max_batch_size = max_batch_size
 
         if max_seq_len is not None:
             assert max_seq_len <= model.config.max_seq_len, \
@@ -882,6 +893,11 @@ class ExLlamaV2DynamicGenerator:
                         "stop_string"
                         "max_new_tokens"
                         "end_filter"
+                    optional, if "eos_reason" == "stop_token":
+                        "eos_triggering_token_id": int
+                        "eos_triggering_token_str": str
+                    optional, if "eos_reason" == "stop_string":
+                        "eos_triggering_string": str
                     "full_completion": str  - full text completion
                     "new_tokens": int  - number of tokens generated
                     "time_enqueued": float  - time from job was enqueued until it started, in seconds
@@ -1013,7 +1029,7 @@ class ExLlamaV2DynamicGenerator:
         for job in self.active_jobs:
             if not job.is_prefill_done(): continue
             if job.time_first_token is None:
-                torch.cuda.synchronize()
+                cuda_sync_active()
                 job.time_first_token = time.time()
             job_ids = job.get_input_ids_list()
             input_ids_list += job_ids
@@ -1091,7 +1107,7 @@ class ExLlamaV2DynamicGenerator:
             logit_mapping.append(len(input_ids_list))
             if not job.is_prefill_done(): continue
             if job.time_first_token is None:
-                torch.cuda.synchronize()
+                cuda_sync_active()
                 job.time_first_token = time.time()
             if draft_tokens is None:
                 job_ids = job.get_input_ids_list(add_to_cache = True)
@@ -1713,6 +1729,8 @@ class ExLlamaV2DynamicJob:
 
         # Start filters
 
+        # TODO: Try to move filter evaluation to the end of the forward pass, before sampling so it can potentially
+        #   occur while waiting for the CUDA queue
         if self.new_tokens == 0:
             for f in self.filters: f.begin("")
 
@@ -1838,7 +1856,10 @@ class ExLlamaV2DynamicJob:
             eos_reason: str = None,
             emit_held = False,
             suppressed_text = None,
-            suppressed_tokens = None
+            suppressed_tokens = None,
+            stop_token: int = None,
+            stop_string: str = None,
+            rem_held_text: str = None
         ):
             r = {
                 "job": self,
@@ -1849,6 +1870,15 @@ class ExLlamaV2DynamicJob:
 
             if eos_reason is not None:
                 r.update({ "eos_reason": eos_reason })
+                if eos_reason == "stop_token":
+                    id_to_piece = self.generator.tokenizer.get_id_to_piece_list(True)
+                    r.update({
+                        "eos_triggering_token_id": stop_token,
+                        "eos_triggering_token_str": id_to_piece[stop_token]
+                    })
+                    pass
+                if eos_reason == "stop_string":
+                    r.update({ "eos_triggering_string": stop_string })
 
             if emit_held:
                 if self.held_text != "":
@@ -1884,25 +1914,36 @@ class ExLlamaV2DynamicJob:
                     "time_enqueued": self.time_first_prefill - self.time_enqueue,
                     "time_prefill": self.time_first_token - self.time_first_prefill,
                     "time_generate": self.time_last_token - self.time_first_token,
-                    "cached_pages": self.cached_pages,
-                    "cached_tokens": self.cached_pages * page_size + self.cached_tokens,
+                    "cached_pages": self.cached_pages // len(self.sequences),
+                    "cached_tokens": (self.cached_pages * page_size + self.cached_tokens) // len(self.sequences),
                 })
                 if self.generator.draft_model or self.generator.use_ngram_draft:
                     r.update({
                         "accepted_draft_tokens": self.accepted_draft_tokens,
                         "rejected_draft_tokens": self.rejected_draft_tokens
                     })
+                if eos_reason == "stop_string":
+                    self.held_text = rem_held_text
+                rh = {}
+                if self.held_text:
+                    rh.update({ "text": self.held_text })
+                if self.held_tokens:
+                    rh.update({ "token_ids": self.held_tokens.torch().clone() })
+                if self.held_probs:
+                    rh.update({ "token_probs": self.held_probs.torch().clone() })
+                if self.held_k_tokens:
+                    rh.update({ "top_k_tokens": self.held_k_tokens.torch().clone() })
+                    rh.update({ "top_k_probs": self.held_k_probs.torch().clone() })
+                if self.held_logits:
+                    rh.update({ "logits": self.held_logits.torch().clone() })
+                if rh:
+                    r.update({ "held": rh })
 
             if self.identifier is not None:
                 r.update({ "identifier": self.identifier })
 
             results.append(r)
             return emit_eos, next_token
-
-        # End on stop tokens
-
-        if next_token.item() in self.stop_tokens:
-            return emit(results, emit_eos = True, eos_reason = "stop_token")
 
         # Decode and buffer output
 
@@ -1921,7 +1962,12 @@ class ExLlamaV2DynamicJob:
             self.held_k_tokens.append(next_k_tokens)
             self.held_k_probs.append(next_k_probs)
         if self.return_logits:
-            self.held_logits.append(logits)
+            self.held_logits.append(logits[:1, :, :])
+
+        # End on stop tokens
+
+        if next_token.item() in self.stop_tokens:
+            return emit(results, emit_eos = True, eos_reason = "stop_token", stop_token = next_token.item())
 
         # Stop if we reach max_new_tokens
 
@@ -2021,8 +2067,19 @@ class ExLlamaV2DynamicJob:
                 self.stop_strings_utf32_buffer
             )
             if match >= 0:
+                held = self.held_text[match:]
                 self.held_text = self.held_text[:match]
-                return emit(results, emit_eos = True, emit_held = True, eos_reason = "stop_string")
+                for s in self.stop_strings:
+                    if held.startswith(s):
+                        return emit(
+                            results,
+                            emit_eos = True,
+                            emit_held = True,
+                            eos_reason = "stop_string",
+                            stop_string = s,
+                            rem_held_text = held
+                        )
+                assert False, "Detected stop string but couldn't identify it (logic error)"
             if match == -2:
                 return emit(results)
 
@@ -2163,8 +2220,9 @@ class ExLlamaV2DynamicJob:
                         if match > best_match:
                             best_match = match
                             best_match_page = page
-                    if best_match_page:
+                    if best_match_page and best_match > 1:
                         page = seq.allocated_pages[p0]
+                        # print([sap.page_index for sap in seq.allocated_pages])
                         for c in [self.generator.cache] if not self.generator.draft_model else \
                             [self.generator.cache, self.generator.draft_cache]:
                             c.copy_states(

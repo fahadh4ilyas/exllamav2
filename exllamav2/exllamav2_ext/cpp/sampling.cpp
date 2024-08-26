@@ -129,7 +129,7 @@ int softmax_cpu_nonavx2
 
     for (int i = 0; i < vocab_size; i++)
     {
-        if (!logits_filter[i]) continue;
+        if (logits_filter && !logits_filter[i]) continue;
         if (logits[i] > maxl)
         {
             maxl = logits[i];
@@ -139,7 +139,7 @@ int softmax_cpu_nonavx2
 
     for (int i = 0; i < vocab_size; i++)
     {
-        if (!logits_filter[i]) continue;
+        if (logits_filter && !logits_filter[i]) continue;
         float l = logits[i] - maxl;
         if (exponent == 2.0f)
             l *= -l;
@@ -154,7 +154,7 @@ int softmax_cpu_nonavx2
 
     for (int i = 0; i < vocab_size; i++)
     {
-        if (logits_filter[i]) output[i] *= isum;
+        if (!logits_filter || logits_filter[i]) output[i] *= isum;
         else output[i] = 0.0f;
     }
 
@@ -833,7 +833,12 @@ int multinomial_cpu
     while (true)
     {
         if (accum >= random) break;
-        if (idx == num_candidates - 1) break;
+        if (idx == num_candidates - 1)
+        {
+            // Roll back in case the sampled probability is exactly zero
+            while (idx > 0 && temp_probs[idx] == 0.0f) idx--;
+            break;
+        }
         idx++;
         accum += temp_probs[idx];
     }
